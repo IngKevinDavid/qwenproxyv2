@@ -7,7 +7,7 @@ echo.
 node -v >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Node.js no está instalado en este sistema.
-    echo Por favor descarga e instala Node.js (Version >= 20) desde https://nodejs.org/
+    echo Por favor descarga e instala Node.js [Version 20 o superior] desde https://nodejs.org/
     pause
     exit /b
 )
