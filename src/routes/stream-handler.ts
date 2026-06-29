@@ -1,0 +1,506 @@
+import type { Context } from 'hono';
+import { stream as honoStream } from 'hono/streaming';
+import { StreamingToolParser } from '../tools/parser.js';
+import { QwenStreamParser } from '../utils/qwen-stream-parser.js';
+import { getIncrementalDelta, parseQwenErrorPayload } from './sse-parser.js';
+import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-handler.js';
+import { removeStream } from '../core/stream-registry.js';
+import { updateSessionParent, saveClientConversation, calculateConversationHash, getSessionParent } from '../services/qwen.js';
+import { releaseAccountInUse } from '../core/account-manager.js';
+import { activeChatsByAccount } from './chat.js';
+import { incrementAccountTokens } from '../core/accounts.js';
+import { getBaseAccountId } from '../core/account-lanes.js';
+import { addDashboardLog } from '../core/logger.js';
+
+export interface StreamHandlerContext {
+  stream: ReadableStream;
+  completionId: string;
+  model: string;
+  uiSessionId: string;
+  hasTools: boolean;
+  tools: any[];
+  finalPrompt: string;
+  streamOptions?: { include_usage?: boolean };
+  accountId: string;
+  messages: any[];
+}
+
+export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): any {
+  const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+  if (socket && typeof socket.setNoDelay === 'function') {
+    socket.setNoDelay(true);
+  }
+
+  c.header('Content-Type', 'text/event-stream');
+  c.header('Cache-Control', 'no-cache, no-transform');
+  c.header('Connection', 'keep-alive');
+  c.header('X-Accel-Buffering', 'no');
+
+  return honoStream(c, async (streamWriter: any) => {
+    let heartbeatInterval: any;
+    let assistantText = '';
+    const accumulatedToolCalls: any[] = [];
+    let assistantReasoning = '';
+    let generationSuccess = false;
+    let totalTokensEmitted = 0;
+    try {
+      await streamWriter.write(': heartbeat\n\n');
+      heartbeatInterval = setInterval(async () => {
+        try {
+          await streamWriter.write(': keep-alive\n\n');
+        } catch { clearInterval(heartbeatInterval);
+        }
+      }, 15000);
+
+      const writeEvent = (data: any) => {
+        streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+
+      const makeChoice = (delta: any, finishReason: string | null = null) => ({
+        index: 0,
+        delta,
+        logprobs: null,
+        finish_reason: finishReason
+      });
+
+      const emittedStreamingToolIds = new Set<string>();
+
+      const emitStreamingToolCall = (tc: { id: string; name: string; arguments: Record<string, unknown> }, index: number) => {
+        if (emittedStreamingToolIds.has(tc.id)) return;
+        emittedStreamingToolIds.add(tc.id);
+        accumulatedToolCalls.push({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+        });
+        streamWriter.write(`data: ${JSON.stringify({
+          id: ctx.completionId,
+          object: 'chat.completion.chunk',
+          created: createdTimestamp,
+          model: ctx.model,
+          choices: [makeChoice({
+            tool_calls: [{
+              index,
+              id: tc.id,
+              type: 'function',
+              function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+            }]
+          })]
+        })}\n\n`);
+      };
+
+      const createdTimestamp = Math.floor(Date.now() / 1000);
+
+      const fastWriteContent = (content: string) => {
+        const escaped = JSON.stringify(content).slice(1, -1);
+        streamWriter.write(`data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":"${ctx.model}","choices":[{"index":0,"delta":{"content":"${escaped}"},"logprobs":null,"finish_reason":null}]}\n\n`);
+      };
+
+      const fastWriteReasoning = (content: string) => {
+        const escaped = JSON.stringify(content).slice(1, -1);
+        streamWriter.write(`data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":"${ctx.model}","choices":[{"index":0,"delta":{"reasoning_content":"${escaped}"},"logprobs":null,"finish_reason":null}]}\n\n`);
+      };
+
+      writeEvent({
+        id: ctx.completionId,
+        object: 'chat.completion.chunk',
+        created: createdTimestamp,
+        model: ctx.model,
+        choices: [makeChoice({ role: 'assistant', content: '' })]
+      });
+
+      const reader = ctx.stream.getReader();
+      const decoder = new TextDecoder();
+      let _reasoningBuffer = '';
+      let lastFullContent = '';
+      let contentLength = 0;
+      let contentSuffix = '';
+      let targetResponseId: string | null = null;
+      let targetResponseIdSet = false;
+      let currentThoughtIndex = 0;
+      const toolParser = ctx.hasTools ? new StreamingToolParser(ctx.tools) : null;
+      let buffer = '';
+      let bufferOffset = 0;
+      let completionTokens = 0;
+      let promptTokens = Math.ceil(ctx.finalPrompt.length / 3.5);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        while (bufferOffset < buffer.length) {
+          const newlineIdx = buffer.indexOf('\n', bufferOffset);
+          if (newlineIdx === -1) break;
+          const line = buffer.slice(bufferOffset, newlineIdx);
+          bufferOffset = newlineIdx + 1;
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') {
+            streamWriter.write('data: [DONE]\n\n');
+            continue;
+          }
+
+          try {
+            const chunk = JSON.parse(dataStr);
+            if (chunk['response.created'] && chunk['response.created'].response_id) {
+              if (!targetResponseId) {
+                targetResponseId = chunk['response.created'].response_id;
+                targetResponseIdSet = true;
+              }
+              updateSessionParent(ctx.uiSessionId, chunk['response.created'].response_id);
+            } else if (chunk.response_id && !targetResponseIdSet) {
+              targetResponseId = chunk.response_id;
+              targetResponseIdSet = true;
+              updateSessionParent(ctx.uiSessionId, chunk.response_id);
+            }
+
+            if (chunk.usage) {
+              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
+              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
+            }
+
+            let vStr = '';
+            let foundStr = false;
+            let isThinkingChunk = false;
+
+            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
+                (!targetResponseIdSet || chunk.response_id === targetResponseId)) {
+              const delta = chunk.choices[0].delta;
+              if (delta.phase === 'thinking_summary') {
+                isThinkingChunk = true;
+                if (delta.extra?.summary_thought?.content) {
+                  const thoughts = delta.extra.summary_thought.content;
+                  if (thoughts.length > currentThoughtIndex) {
+                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
+                    currentThoughtIndex = thoughts.length;
+                    foundStr = true;
+                  }
+                }
+              } else if (delta.phase === 'answer') {
+                isThinkingChunk = false;
+                if (delta.content !== undefined) {
+                  const newContent = delta.content || '';
+                  const result = getIncrementalDelta(lastFullContent, newContent, contentLength, contentSuffix);
+                  vStr = result.delta;
+                  if (vStr) {
+                    lastFullContent = result.matchedContent;
+                    contentLength = result.contentLength;
+                    contentSuffix = result.contentSuffix;
+                    foundStr = true;
+                  }
+                }
+              }
+            }
+
+            if (foundStr && vStr !== '') {
+              if (vStr === 'FINISHED') continue;
+              if (isThinkingChunk) {
+                _reasoningBuffer += vStr;
+                assistantReasoning += vStr;
+                fastWriteReasoning(vStr);
+              } else {
+                if (ctx.hasTools && toolParser) {
+                  const { text, toolCalls } = toolParser.feed(vStr);
+                  if (text) {
+                    if (looksLikeUnwrappedToolCall(text)) {
+                      const unwrappedToolCalls = parseUnwrappedToolCalls(text);
+                      const baseIndex = toolParser.getEmittedToolCallCount();
+                      for (let idx = 0; idx < unwrappedToolCalls.length; idx++) {
+                        const tc = unwrappedToolCalls[idx];
+                        emitStreamingToolCall(tc, baseIndex + idx);
+                      }
+                    } else {
+                      assistantText += text;
+                      fastWriteContent(text);
+                    }
+                  }
+                  for (const tc of toolCalls) {
+                    emitStreamingToolCall(tc, toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc));
+                  }
+                } else {
+                  if (vStr) {
+                    assistantText += vStr;
+                    fastWriteContent(vStr);
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            if (dataStr.length > 10) {
+              console.warn(`[Chat] Error de parseo SSE para el chunk (${dataStr.length} caracteres):`, (e as Error).message);
+            }
+          }
+        }
+
+        if (bufferOffset > 0) {
+          buffer = buffer.slice(bufferOffset);
+          bufferOffset = 0;
+        }
+      }
+
+      const upstreamError = parseQwenErrorPayload(buffer);
+      if (upstreamError) {
+        writeEvent({
+          id: ctx.completionId,
+          object: 'chat.completion.chunk',
+          created: createdTimestamp,
+          model: ctx.model,
+          choices: [makeChoice({ content: upstreamError.message })]
+        });
+        writeEvent({
+          id: ctx.completionId,
+          object: 'chat.completion.chunk',
+          created: createdTimestamp,
+          model: ctx.model,
+          choices: [makeChoice({}, 'stop')]
+        });
+        streamWriter.write('data: [DONE]\n\n');
+        return;
+      }
+
+      if (toolParser) {
+        const flushResult = toolParser.flush();
+        if (flushResult.text) {
+          if (ctx.hasTools && looksLikeUnwrappedToolCall(flushResult.text)) {
+            const unwrappedToolCalls = parseUnwrappedToolCalls(flushResult.text);
+            const baseIndex = toolParser.getEmittedToolCallCount();
+            for (let idx = 0; idx < unwrappedToolCalls.length; idx++) {
+              const tc = unwrappedToolCalls[idx];
+              emitStreamingToolCall(tc, baseIndex + idx);
+            }
+          } else {
+            assistantText += flushResult.text;
+            writeEvent({
+              id: ctx.completionId,
+              object: 'chat.completion.chunk',
+              created: createdTimestamp,
+              model: ctx.model,
+              choices: [makeChoice({ content: flushResult.text })]
+            });
+          }
+        }
+        for (const tc of flushResult.toolCalls) {
+          const idx = toolParser.getEmittedToolCallCount() - flushResult.toolCalls.length + flushResult.toolCalls.indexOf(tc);
+          emitStreamingToolCall(tc, idx);
+        }
+      }
+
+      totalTokensEmitted = promptTokens + completionTokens;
+      const usage = {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: totalTokensEmitted,
+        prompt_tokens_details: { cached_tokens: 0 }
+      };
+
+      const finalFinishReason = toolParser && toolParser.getEmittedToolCallCount() > 0 ? 'tool_calls' : 'stop';
+
+      writeEvent({
+        id: ctx.completionId,
+        object: 'chat.completion.chunk',
+        created: createdTimestamp,
+        model: ctx.model,
+        choices: [makeChoice({}, finalFinishReason)],
+        ...(ctx.streamOptions?.include_usage ? {} : { usage })
+      });
+
+      if (ctx.streamOptions?.include_usage) {
+        writeEvent({
+          id: ctx.completionId,
+          object: 'chat.completion.chunk',
+          created: createdTimestamp,
+          model: ctx.model,
+          choices: [],
+          usage
+        });
+      }
+      generationSuccess = true;
+      streamWriter.write('data: [DONE]\n\n');
+    } finally {
+      clearInterval(heartbeatInterval);
+      if (generationSuccess) {
+        const latestParentId = getSessionParent(ctx.uiSessionId);
+        if (latestParentId) {
+          const assistantMessage: any = {
+            role: 'assistant',
+            content: accumulatedToolCalls.length ? null : assistantText
+          };
+          if (assistantReasoning) {
+            assistantMessage.reasoning_content = assistantReasoning;
+          }
+          if (accumulatedToolCalls.length) {
+            accumulatedToolCalls.forEach((tc, idx) => tc.index = idx);
+            assistantMessage.tool_calls = accumulatedToolCalls;
+          }
+          
+          const updatedHistory = [...ctx.messages, assistantMessage];
+          const nextHash = calculateConversationHash(updatedHistory);
+          saveClientConversation(nextHash, {
+            chatId: ctx.uiSessionId,
+            accountId: ctx.accountId,
+            parentId: latestParentId
+          });
+          activeChatsByAccount.set(ctx.accountId, {
+            chatId: ctx.uiSessionId,
+            parentId: latestParentId
+          });
+          addDashboardLog(`Estado de la conversación guardado. Hash: ${nextHash}, Chat ID: ${ctx.uiSessionId}, Parent ID: ${latestParentId}`, 'info', 'Caché');
+        }
+      }
+      removeStream(ctx.completionId);
+      releaseAccountInUse(ctx.accountId);
+      
+      if (totalTokensEmitted > 0) {
+        try {
+          incrementAccountTokens(getBaseAccountId(ctx.accountId), totalTokensEmitted, ctx.model);
+        } catch (err: any) {
+          console.error('[Caché] Falló al incrementar los tokens:', err.message);
+        }
+      }
+    }
+  });
+}
+
+export function handleNonStreamingResponse(
+  c: Context,
+  stream: ReadableStream,
+  completionId: string,
+  model: string,
+  uiSessionId: string,
+  hasTools: boolean,
+  tools: any[],
+  accountId: string,
+  messages: any[],
+): any {
+  return (async () => {
+    try {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      const toolCallsOut: any[] = [];
+      const seenToolCallIds = new Set<string>();
+      let buffer = '';
+
+      const pushToolCall = (tc: { id: string; name: string; arguments: Record<string, unknown> }) => {
+        if (seenToolCallIds.has(tc.id)) return;
+        seenToolCallIds.add(tc.id);
+        toolCallsOut.push({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+        });
+      };
+
+      const qwenParser = new QwenStreamParser(uiSessionId, {
+        tools: hasTools ? tools : [],
+        onThinking: () => {},
+        onToolCall: (tc) => {
+          pushToolCall(tc);
+        },
+      });
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') continue;
+          qwenParser.parseLine(dataStr);
+        }
+      }
+
+      const upstreamError = parseQwenErrorPayload(buffer);
+      if (upstreamError) {
+        removeStream(completionId);
+        return c.json({ error: { message: upstreamError.message } }, upstreamError.status as any);
+      }
+
+      const { text: remainingText, toolCalls: remainingToolCalls } = qwenParser.flush();
+      const parserState = qwenParser.state;
+      let finalContent = parserState.lastFullContent;
+      if (remainingText) finalContent += remainingText;
+      for (const tc of remainingToolCalls) {
+        pushToolCall(tc);
+      }
+
+      if (hasTools && toolCallsOut.length === 0) {
+        for (const tc of parseUnwrappedToolCalls(finalContent)) {
+          pushToolCall(tc);
+        }
+        if (toolCallsOut.length > 0) finalContent = '';
+      }
+
+      const usage = {
+        prompt_tokens: parserState.promptTokens,
+        completion_tokens: parserState.completionTokens,
+        total_tokens: parserState.promptTokens + parserState.completionTokens,
+        prompt_tokens_details: { cached_tokens: 0 }
+      };
+      const message: any = { role: 'assistant', content: toolCallsOut.length ? null : finalContent };
+      if (parserState.reasoningBuffer) message.reasoning_content = parserState.reasoningBuffer;
+      if (toolCallsOut.length) toolCallsOut.forEach((tc, idx) => tc.index = idx);
+      if (toolCallsOut.length) message.tool_calls = toolCallsOut;
+
+      const latestParentId = getSessionParent(uiSessionId);
+      if (latestParentId) {
+        const assistantMessage: any = {
+          role: 'assistant',
+          content: toolCallsOut.length ? null : finalContent
+        };
+        if (parserState.reasoningBuffer) {
+          assistantMessage.reasoning_content = parserState.reasoningBuffer;
+        }
+        if (toolCallsOut.length) {
+          toolCallsOut.forEach((tc, idx) => tc.index = idx);
+          assistantMessage.tool_calls = toolCallsOut;
+        }
+
+        const updatedHistory = [...messages, assistantMessage];
+        const nextHash = calculateConversationHash(updatedHistory);
+        saveClientConversation(nextHash, {
+          chatId: uiSessionId,
+          accountId,
+          parentId: latestParentId
+        });
+        activeChatsByAccount.set(accountId, {
+          chatId: uiSessionId,
+          parentId: latestParentId
+        });
+        addDashboardLog(`Estado de la conversación no-streaming guardado. Hash: ${nextHash}, Chat ID: ${uiSessionId}, Parent ID: ${latestParentId}`, 'info', 'Caché');
+      }
+
+      removeStream(completionId);
+      
+      const totalTokens = usage?.total_tokens || 0;
+      if (totalTokens > 0) {
+        try {
+          incrementAccountTokens(getBaseAccountId(accountId), totalTokens, model);
+        } catch (err: any) {
+          console.error('[Caché] Falló al incrementar los tokens:', err.message);
+        }
+      }
+
+      return c.json({
+        id: completionId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          message,
+          logprobs: null,
+          finish_reason: toolCallsOut.length ? 'tool_calls' : 'stop'
+        }],
+        usage
+      });
+    } finally {
+      releaseAccountInUse(accountId);
+    }
+  })();
+}
